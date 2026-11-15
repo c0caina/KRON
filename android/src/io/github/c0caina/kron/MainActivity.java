@@ -1,4 +1,4 @@
-package io.github.k0de1ne.kron;
+package io.github.c0caina.kron;
 
 import android.app.Activity;
 import android.content.Intent;
@@ -9,7 +9,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceError;
 
 public class MainActivity extends Activity {
-    static final int PORT = 7790;
+    static final int PORT = 7791;
     static final String UI = "http://127.0.0.1:" + PORT + "/";
     private int retries;
     @Override public void onCreate(Bundle state) {
@@ -28,7 +28,7 @@ public class MainActivity extends Activity {
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (!request.isForMainFrame()) return;
-                if (++retries < 60) view.postDelayed(() -> view.loadUrl(UI), 1000);
+                if (++retries < 300) view.postDelayed(() -> view.loadUrl(UI), 1000);
                 else {
                     String log;
                     try { log = new String(java.nio.file.Files.readAllBytes(KronService.logFile(MainActivity.this).toPath()), java.nio.charset.StandardCharsets.UTF_8); }

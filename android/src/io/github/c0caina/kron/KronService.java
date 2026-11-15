@@ -1,4 +1,4 @@
-package io.github.k0de1ne.kron;
+package io.github.c0caina.kron;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -118,7 +118,8 @@ public class KronService extends Service {
                 int n;
                 while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
             }
-            if (destination.getName().equals("kron") && !temporary.setExecutable(true, true))
+            if ((destination.getName().equals("kron") || destination.getName().equals("llama-server"))
+                    && !temporary.setExecutable(true, true))
                 throw new IOException("Cannot mark runtime executable");
             if (!temporary.renameTo(destination)) throw new IOException("Cannot install " + destination);
         }

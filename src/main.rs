@@ -33,12 +33,12 @@ async fn main() -> Result<()> {
         std::fs::write(
             &path,
             serde_json::to_string_pretty(&Config {
-                base_url: "https://api.openai.com/v1".into(),
-                model: "gpt-4.1".into(),
+                base_url: "http://127.0.0.1:7792/v1".into(),
+                model: "ignition".into(),
                 api_key: String::new(),
             })?,
         )?;
-        eprintln!("Created {}. Set base_url, model and api_key before sending a message.", path.display());
+        eprintln!("Created {}. Using the local ignition model.", path.display());
     }
     let runtime = std::env::var_os("KRON_RUNTIME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("runtime"));
     let ui = runtime.join("ui");
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
             bail!("Grant KRON root access in your root manager");
         }
     }
-    let listen = std::env::var("KRON_LISTEN").unwrap_or_else(|_| "127.0.0.1:7790".into());
+    let listen = std::env::var("KRON_LISTEN").unwrap_or_else(|_| "127.0.0.1:7791".into());
     let address: std::net::SocketAddr = listen.parse()?;
     if !address.ip().is_loopback() {
         bail!("KRON_LISTEN must be a loopback address");

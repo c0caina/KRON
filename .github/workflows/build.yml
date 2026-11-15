@@ -44,7 +44,20 @@ jobs:
         if: matrix.test
         env:
           KRON_BIN: target/${{ matrix.target }}/release/kron
-        run: python3 tests/smoke.py
+        run: |
+          python3 tests/smoke.py
+          python3 tests/launcher.py
+
+      - uses: actions/cache@v4
+        if: matrix.target == 'aarch64-linux-android'
+        id: ignition
+        with:
+          path: ignition-files
+          key: ignition-lfm2.5-2.6b-q4km-b11500-v1
+
+      - name: Prepare ignition model
+        if: matrix.target == 'aarch64-linux-android' && steps.ignition.outputs.cache-hit != 'true'
+        run: bash android/ignition.sh ignition-files
 
       - name: Android app
         if: matrix.target == 'aarch64-linux-android'
@@ -54,7 +67,7 @@ jobs:
           VERSION_NAME: ${{ github.ref_name }}-${{ github.run_number }}
         run: |
           (yes 2>/dev/null || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null
-          android/build.sh target/${{ matrix.target }}/release/kron target/${{ matrix.target }}/release/kron.apk
+          android/build.sh target/${{ matrix.target }}/release/kron target/${{ matrix.target }}/release/kron.apk ignition-files
 
       - name: Package editable runtime
         shell: bash
@@ -70,29 +83,30 @@ jobs:
             target/${{ matrix.target }}/release/kron-runtime.tar.gz
             target/${{ matrix.target }}/release/kron.apk
           if-no-files-found: error
+          compression-level: 0
 
-  # Direct download links (no zip, no GitHub login), refreshed on every push:
-  # https://github.com/<owner>/<repo>/releases/download/latest/kron.apk
+  # Direct APK link for this branch (no zip, no GitHub login):
+  # https://github.com/<owner>/<repo>/releases/download/minimal/kron-minimal.apk
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/minimal-root-harness'
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency: release-latest
+    concurrency: release-minimal
     steps:
       - uses: actions/download-artifact@v4
-      - name: Publish the "latest" pre-release
+      - name: Publish the "minimal" pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir out
-          cp kron-aarch64-linux-android/kron.apk out/kron.apk
+          cp kron-aarch64-linux-android/kron.apk out/kron-minimal.apk
           cp kron-aarch64-linux-android/kron out/kron-android-arm64
           cp kron-x86_64-unknown-linux-gnu/kron-runtime.tar.gz out/kron-linux-x64.tar.gz
           cp kron-aarch64-linux-android/kron-runtime.tar.gz out/kron-android-arm64.tar.gz
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest out/* --prerelease --target "$GITHUB_SHA" \
-            --title "latest (${GITHUB_REF_NAME} @ ${GITHUB_SHA::7})" \
-            --notes "Сборка из ${GITHUB_REF_NAME}. Телефон: скачайте и установите kron.apk."
+          gh release delete minimal --yes --cleanup-tag || true
+          gh release create minimal out/* --prerelease --target "$GITHUB_SHA" \
+            --title "minimal (${GITHUB_REF_NAME} @ ${GITHUB_SHA::7})" \
+            --notes "Сборка из ${GITHUB_REF_NAME}. Телефон: скачайте и установите kron-minimal.apk. Включает локальную LFM2.5 2.6B Q4_K_M, около 1.8 ГБ; root обязателен."
