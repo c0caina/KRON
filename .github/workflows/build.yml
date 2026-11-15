@@ -56,12 +56,18 @@ jobs:
           (yes 2>/dev/null || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null
           android/build.sh target/${{ matrix.target }}/release/kron target/${{ matrix.target }}/release/kron.apk
 
+      - name: Package editable runtime
+        shell: bash
+        run: |
+          tar -czf target/${{ matrix.target }}/release/kron-runtime.tar.gz \
+            -C target/${{ matrix.target }}/release kron -C "$GITHUB_WORKSPACE" runtime
+
       - uses: actions/upload-artifact@v4
         with:
           name: kron-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/kron
-            target/${{ matrix.target }}/release/kron.exe
+            target/${{ matrix.target }}/release/kron-runtime.tar.gz
             target/${{ matrix.target }}/release/kron.apk
           if-no-files-found: error
 
@@ -84,7 +90,8 @@ jobs:
           mkdir out
           cp kron-aarch64-linux-android/kron.apk out/kron.apk
           cp kron-aarch64-linux-android/kron out/kron-android-arm64
-          cp kron-x86_64-unknown-linux-gnu/kron out/kron-linux-x64
+          cp kron-x86_64-unknown-linux-gnu/kron-runtime.tar.gz out/kron-linux-x64.tar.gz
+          cp kron-aarch64-linux-android/kron-runtime.tar.gz out/kron-android-arm64.tar.gz
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest out/* --prerelease --target "$GITHUB_SHA" \
             --title "latest (${GITHUB_REF_NAME} @ ${GITHUB_SHA::7})" \

@@ -19,9 +19,12 @@ public class MainActivity extends Activity {
         startForegroundService(new Intent(this, KronService.class));
         WebView web = new WebView(this);
         web.getSettings().setJavaScriptEnabled(true);
+        web.getSettings().setCacheMode(android.webkit.WebSettings.LOAD_NO_CACHE);
         web.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return !UI.equals(request.getUrl().toString());
+                return !("http".equals(request.getUrl().getScheme())
+                        && "127.0.0.1".equals(request.getUrl().getHost())
+                        && request.getUrl().getPort() == PORT);
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (!request.isForMainFrame()) return;

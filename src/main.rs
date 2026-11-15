@@ -3,8 +3,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Html,
-    routing::{get, post},
+    routing::post,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,13 +19,12 @@ struct Config {
 }
 
 struct App {
-    config: Config,
+    config_path: PathBuf,
+    prompt_path: PathBuf,
     client: reqwest::Client,
     history: Mutex<Vec<Value>>,
     origin: String,
 }
-
-const SYSTEM: &str = "You are an autonomous agent on the user's device. Your only tool is console. Use shell commands for files, programs, networking, and any other work. You have the full permissions of the shell (root on Android). Decide how to accomplish the user's request yourself. Commands run in separate shells; use explicit paths or cd in each command. Use background jobs and files for long-running tasks. Tool output is bounded; redirect large output to files and inspect it in chunks. Reply to the user when finished.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,7 +40,10 @@ async fn main() -> Result<()> {
         )?;
         eprintln!("Created {}. Set base_url, model and api_key before sending a message.", path.display());
     }
-    let config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let runtime = std::env::var_os("KRON_RUNTIME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("runtime"));
+    let ui = runtime.join("ui");
+    let prompt_path = runtime.join("system.md");
+    std::fs::read_to_string(&prompt_path).context("Cannot read system.md in KRON_RUNTIME")?;
     if cfg!(target_os = "android") {
         let output =
             Command::new("su").args(["-c", "id -u"]).output().await.context("Android requires su root access")?;
@@ -57,16 +58,17 @@ async fn main() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(address).await?;
     let app = Arc::new(App {
-        config,
+        config_path: path,
+        prompt_path,
         client: reqwest::Client::new(),
-        history: Mutex::new(vec![json!({"role":"system", "content":SYSTEM})]),
+        history: Mutex::new(Vec::new()),
         origin: format!("http://{}", listener.local_addr()?),
     });
     eprintln!("{}", app.origin);
     axum::serve(
         listener,
         Router::new()
-            .route("/", get(|| async { Html(include_str!("index.html")) }))
+            .fallback_service(tower_http::services::ServeDir::new(ui))
             .route("/message", post(message))
             .with_state(app),
     )
@@ -98,7 +100,15 @@ async fn message(
     }
     let mut history = app.history.try_lock().map_err(|_| (StatusCode::CONFLICT, "Agent is busy".into()))?;
     // A failed request must not leave an incomplete tool exchange in history.
+    let prompt = std::fs::read_to_string(&app.prompt_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Read system.md: {e}")))?;
     let mut next = history.clone();
+    let system = json!({"role":"system", "content":prompt});
+    if next.is_empty() {
+        next.push(system);
+    } else {
+        next[0] = system;
+    }
     next.push(json!({"role":"user", "content":input.text}));
     let answer = run(&app, &mut next).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     *history = next;
@@ -106,17 +116,18 @@ async fn message(
 }
 
 async fn run(app: &App, messages: &mut Vec<Value>) -> Result<String> {
+    let config: Config = serde_json::from_slice(&std::fs::read(&app.config_path)?)?;
     loop {
-        let body = json!({"model":app.config.model, "messages":messages, "tools":[{
+        let body = json!({"model":config.model, "messages":messages, "tools":[{
             "type":"function", "function":{
                 "name":"console", "description":"Execute a shell command on this device with full permissions. Returns exit code, stdout and stderr. Each invocation uses a fresh shell.",
                 "parameters":{"type":"object", "properties":{"command":{"type":"string"}}, "required":["command"], "additionalProperties":false}
             }
         }]});
         let mut request =
-            app.client.post(format!("{}/chat/completions", app.config.base_url.trim_end_matches('/'))).json(&body);
-        if !app.config.api_key.is_empty() {
-            request = request.bearer_auth(&app.config.api_key);
+            app.client.post(format!("{}/chat/completions", config.base_url.trim_end_matches('/'))).json(&body);
+        if !config.api_key.is_empty() {
+            request = request.bearer_auth(&config.api_key);
         }
         let response = request.send().await?;
         let status = response.status();
@@ -180,6 +191,16 @@ async fn console(command: &str) -> Result<String> {
         c.args(["-c", command]);
         c
     };
+    let cwd = std::env::current_dir()?;
+    shell
+        .env(
+            "KRON_RUNTIME",
+            cwd.join(std::env::var_os("KRON_RUNTIME").map(PathBuf::from).unwrap_or_else(|| "runtime".into())),
+        )
+        .env(
+            "KRON_CONFIG",
+            cwd.join(std::env::var_os("KRON_CONFIG").map(PathBuf::from).unwrap_or_else(|| "kron.json".into())),
+        );
     let mut child =
         shell.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
     let (out, err, status) =

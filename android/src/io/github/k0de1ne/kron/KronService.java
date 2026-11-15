@@ -10,7 +10,9 @@ import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 import java.io.File;
-import java.util.Map;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.IOException;
 
 /** Keeps the local harness running in the foreground service. */
 public class KronService extends Service {
@@ -62,27 +64,33 @@ public class KronService extends Service {
         File home = getFilesDir();
         File work = new File(home, "work");
         work.mkdirs();
-        File exe = new File(getApplicationInfo().nativeLibraryDir, "libkron.so");
+        File runtime = new File(home, "runtime");
+        try {
+            // APK updates never overwrite the agent's files. Seed just once.
+            File marker = new File(home, "runtime-initialized");
+            if (!marker.exists()) {
+                seed("runtime", runtime);
+                if (!marker.createNewFile()) throw new IOException("Cannot mark runtime initialized");
+            }
+        } catch (Exception e) {
+            logError(e);
+            running = false;
+            return;
+        }
         while (running) {
             try {
                 File log = logFile(this);
                 if (log.length() > 1_000_000) log.delete();
-                ProcessBuilder pb = new ProcessBuilder(exe.getAbsolutePath())
+                ProcessBuilder pb = new ProcessBuilder("su", "-c",
+                        "exec /system/bin/sh " + quote(new File(runtime, "start.sh").getAbsolutePath()))
                         .directory(work)
                         .redirectErrorStream(true)
                         .redirectOutput(ProcessBuilder.Redirect.appendTo(log));
-                Map<String, String> env = pb.environment();
-                env.put("TMPDIR", getCacheDir().getAbsolutePath());
-                // Own port, so a kron started by hand (e.g. in Termux) cannot shadow the app.
-                env.put("KRON_LISTEN", "127.0.0.1:" + MainActivity.PORT);
-                // Configuration lives in the app files directory; console uses su.
-                env.put("KRON_CONFIG", new File(home, "kron.json").getAbsolutePath());
+                new File(runtime, "pid").delete();
                 proc = pb.start();
                 proc.waitFor();
             } catch (Exception e) {
-                try (java.io.FileWriter log = new java.io.FileWriter(logFile(this), true)) {
-                    log.write(e.toString() + "\n");
-                } catch (Exception ignored) {}
+                logError(e);
             }
             if (running) {
                 try {
@@ -94,10 +102,44 @@ public class KronService extends Service {
         }
     }
 
+    private static String quote(String value) {
+        return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    private void seed(String asset, File destination) throws IOException {
+        String[] children = getAssets().list(asset);
+        if (children != null && children.length > 0) {
+            if (!destination.isDirectory() && !destination.mkdirs()) throw new IOException("Cannot create " + destination);
+            for (String child : children) seed(asset + "/" + child, new File(destination, child));
+        } else if (!destination.exists()) {
+            File temporary = new File(destination.getPath() + ".seed");
+            try (InputStream in = getAssets().open(asset); FileOutputStream out = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[8192];
+                int n;
+                while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+            }
+            if (destination.getName().equals("kron") && !temporary.setExecutable(true, true))
+                throw new IOException("Cannot mark runtime executable");
+            if (!temporary.renameTo(destination)) throw new IOException("Cannot install " + destination);
+        }
+    }
+
+    private void logError(Exception e) {
+        try (java.io.FileWriter log = new java.io.FileWriter(logFile(this), true)) {
+            log.write(e.toString() + "\n");
+        } catch (Exception ignored) {}
+    }
+
     @Override
     public void onDestroy() {
         running = false;
         Process p = proc;
+        try {
+            if (p == null || !p.isAlive()) throw new IOException("Runtime is not running");
+            File pid = new File(getFilesDir(), "runtime/pid");
+            String value = new String(java.nio.file.Files.readAllBytes(pid.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim();
+            if (value.matches("[0-9]+")) new ProcessBuilder("su", "-c", "kill " + value).start();
+        } catch (Exception ignored) {}
         if (p != null) p.destroy();
         super.onDestroy();
     }

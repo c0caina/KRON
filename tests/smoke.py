@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -43,10 +44,12 @@ with socket.socket() as sock:
     port = sock.getsockname()[1]
 origin = f'http://127.0.0.1:{port}'
 with tempfile.TemporaryDirectory() as directory:
+    runtime = Path(directory) / 'runtime'
+    shutil.copytree('runtime', runtime)
     config = Path(directory) / 'kron.json'
     config.write_text(json.dumps({'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'model': 'mock'}))
     binary = Path(os.environ.get('KRON_BIN', 'target/debug/kron')).resolve()
-    process = subprocess.Popen([str(binary)], cwd=directory, env={**os.environ, 'KRON_CONFIG': str(config), 'KRON_LISTEN': f'127.0.0.1:{port}'})
+    process = subprocess.Popen([str(binary)], cwd=directory, env={**os.environ, 'KRON_CONFIG': str(config), 'KRON_LISTEN': f'127.0.0.1:{port}', 'KRON_RUNTIME': str(runtime)})
     try:
         for _ in range(100):
             try:
@@ -69,7 +72,15 @@ with tempfile.TemporaryDirectory() as directory:
             assert error.code == 403
         assert not calls
         assert json.load(send(origin)) == {'text': 'done'}
+        (runtime / 'system.md').write_text('edited system prompt')
+        (runtime / 'ui' / 'index.html').write_text('<button>edited UI</button>')
+        (runtime / 'ui' / 'app.js').write_text('window.edited=true;')
+        assert urllib.request.urlopen(origin).read() == b'<button>edited UI</button>'
+        assert b'window.edited' in urllib.request.urlopen(origin + '/app.js').read()
+        config.write_text(json.dumps({'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'model': 'edited-model'}))
         assert json.load(send(origin)) == {'text': 'done'}
+        assert calls[2]['messages'][0]['content'] == 'edited system prompt'
+        assert calls[2]['model'] == 'edited-model'
         assert len(calls) == 4
         assert len(calls[2]['messages']) == 6  # Previous tool exchange retained.
         print('PASS: local UI, origin check, console round trip, conversation context')
