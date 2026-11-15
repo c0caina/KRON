@@ -8,32 +8,15 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
-import android.os.Environment;
 import android.os.IBinder;
 import java.io.File;
 import java.util.Map;
 
-/** Keeps `kron app` (the hub and web UI on 127.0.0.1:7700) running in the background. */
+/** Keeps the local harness running in the foreground service. */
 public class KronService extends Service {
     static final String STOP = "stop";
     private volatile boolean running;
     private volatile Process proc;
-    private volatile boolean startedWithStorage;
-    private static volatile KronService instance;
-
-    static boolean hasStorage(android.content.Context c) {
-        if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
-        return c.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                == android.content.pm.PackageManager.PERMISSION_GRANTED;
-    }
-
-    /** Restart kron when storage access changed, so the agent's /shared moves to Internal storage/kron. */
-    static void storageChanged(android.content.Context c) {
-        KronService s = instance;
-        Process p = s == null ? null : s.proc;
-        if (p != null && s.startedWithStorage != hasStorage(c)) p.destroy();
-    }
-
     static File logFile(android.content.Context c) {
         return new File(c.getFilesDir(), "kron.log");
     }
@@ -41,7 +24,6 @@ public class KronService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        instance = this;
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("kron", "kron", NotificationManager.IMPORTANCE_LOW));
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class),
@@ -51,7 +33,7 @@ public class KronService extends Service {
         Notification n = new Notification.Builder(this, "kron")
                 .setSmallIcon(R.drawable.ic_stat)
                 .setContentTitle("kron работает")
-                .setContentText("Агенты и чаты работают на телефоне")
+                .setContentText("Агент работает на телефоне")
                 .setContentIntent(open)
                 .addAction(new Notification.Action.Builder(null, "Остановить", stop).build())
                 .setOngoing(true)
@@ -85,24 +67,22 @@ public class KronService extends Service {
             try {
                 File log = logFile(this);
                 if (log.length() > 1_000_000) log.delete();
-                ProcessBuilder pb = new ProcessBuilder(exe.getAbsolutePath(), "app")
+                ProcessBuilder pb = new ProcessBuilder(exe.getAbsolutePath())
                         .directory(work)
                         .redirectErrorStream(true)
                         .redirectOutput(ProcessBuilder.Redirect.appendTo(log));
                 Map<String, String> env = pb.environment();
-                env.put("HOME", home.getAbsolutePath());
                 env.put("TMPDIR", getCacheDir().getAbsolutePath());
-                env.put("SHELL", "/system/bin/sh");
                 // Own port, so a kron started by hand (e.g. in Termux) cannot shadow the app.
                 env.put("KRON_LISTEN", "127.0.0.1:" + MainActivity.PORT);
-                env.put("HOSTNAME", Build.MODEL.toLowerCase().replaceAll("[^a-z0-9]+", "-"));
-                // proot and the agent's Ubuntu (see src/sandbox.rs).
-                env.put("KRON_NATIVE_DIR", getApplicationInfo().nativeLibraryDir);
-                startedWithStorage = hasStorage(this);
+                // Configuration lives in the app files directory; console uses su.
+                env.put("KRON_CONFIG", new File(home, "kron.json").getAbsolutePath());
                 proc = pb.start();
                 proc.waitFor();
             } catch (Exception e) {
-                // Logged by the UI's error page through kron.log; retry below.
+                try (java.io.FileWriter log = new java.io.FileWriter(logFile(this), true)) {
+                    log.write(e.toString() + "\n");
+                } catch (Exception ignored) {}
             }
             if (running) {
                 try {
@@ -117,7 +97,6 @@ public class KronService extends Service {
     @Override
     public void onDestroy() {
         running = false;
-        instance = null;
         Process p = proc;
         if (p != null) p.destroy();
         super.onDestroy();

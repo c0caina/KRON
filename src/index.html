@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kron</title>
+<style>body{max-width:42rem;margin:0 auto;padding:16px;font:16px system-ui}textarea{box-sizing:border-box;width:100%;font:inherit}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}button{font:inherit;margin-top:8px;padding:8px 16px}</style>
+<form><textarea aria-label="Сообщение" placeholder="Сообщение" rows="3" required></textarea><button>Отправить</button></form>
+<pre aria-live="polite"></pre>
+<script>
+const form=document.querySelector('form'), input=document.querySelector('textarea'), button=document.querySelector('button'), answer=document.querySelector('pre');
+form.onsubmit=async event=>{
+ event.preventDefault();button.disabled=true;answer.textContent='…';
+ try {
+  const response=await fetch('/message',{method:'POST',headers:{'Content-Type':'application/json','X-Kron':'1'},body:JSON.stringify({text:input.value})});
+  if(!response.ok)throw new Error(await response.text());
+  answer.textContent=(await response.json()).text;
+ }catch(error){answer.textContent=error.message;}finally{button.disabled=false;}
+};
+</script></html>

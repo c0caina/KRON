@@ -1,35 +1,19 @@
 [package]
 name = "kron"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "One harness for all your AI subscriptions: agents, chats, every device"
-
-[[bin]]
-name = "kron"
-path = "src/main.rs"
+description = "Minimal model and root console harness"
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
 axum = "0.7"
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-clap = { version = "4", features = ["derive"] }
-flate2 = "1"
-futures = "0.3"
-ignore = "0.4"
-rand = "0.8"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
-tar = { version = "0.4", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
-toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "sync", "io-util"] }
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = true
+codegen-units = 1
+opt-level = "s"

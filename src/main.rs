@@ -1,348 +1,207 @@
-mod agent;
-mod auth;
-mod browser;
-mod config;
-mod face;
-mod files;
-mod hub;
-mod llm;
-mod local;
-mod lock;
-mod node;
-mod sandbox;
-mod store;
-mod tools;
-mod turn;
-mod types;
-
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use config::Config;
-use std::io::IsTerminal;
-use std::path::PathBuf;
-use std::sync::Arc;
-use store::Store;
-use turn::TurnReq;
-use types::{Message, Stdout};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Html,
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{path::PathBuf, process::Stdio, sync::Arc};
+use tokio::{io::AsyncReadExt, process::Command, sync::Mutex};
 
-#[derive(Parser)]
-#[command(name = "kron", version, about = "One harness for all your AI subscriptions")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-    #[command(flatten)]
-    run: RunArgs,
-    /// Config file (default: ~/.kron/config.toml)
-    #[arg(short, long, global = true)]
-    config: Option<PathBuf>,
-    /// Ignore the hub: run and store everything on this machine
-    #[arg(long, global = true)]
-    local: bool,
+#[derive(Deserialize, Serialize)]
+struct Config {
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_key: String,
 }
 
-#[derive(Args, Default)]
-struct RunArgs {
-    /// What to do. Without it: interactive session (or stdin when piped).
-    prompt: Vec<String>,
-    /// Continue this thread (default: start a new one)
-    #[arg(short, long)]
-    thread: Option<String>,
-    /// Agent from config
-    #[arg(short, long)]
-    agent: Option<String>,
-    /// Provider from config
-    #[arg(short, long)]
-    provider: Option<String>,
-    #[arg(short, long)]
-    model: Option<String>,
-    /// Plain question/answer, no tools
-    #[arg(long)]
-    chat: bool,
-    /// Ask a web chat through the browser (chatgpt, gemini)
-    #[arg(long, value_name = "SITE")]
-    web: Option<String>,
-    /// Run tools / the browser on this node (via the hub)
-    #[arg(long, value_name = "NODE")]
-    on: Option<String>,
-    /// The agent may look (read files, search) but not run commands or edit
-    #[arg(long)]
-    read_only: bool,
+struct App {
+    config: Config,
+    client: reqwest::Client,
+    history: Mutex<Vec<Value>>,
+    origin: String,
 }
 
-#[derive(Subcommand)]
-enum Cmd {
-    /// Write an example config to ~/.kron/config.toml
-    Init,
-    /// Run the hub: threads, agent loops, web UI, node coordination
-    Serve,
-    /// What the Android app runs: creates a config if missing, serves the UI on
-    /// this device and, with [hub] url set, also works as a node for that hub
-    App,
-    /// Connect this machine to the hub so agents can work on it
-    Node {
-        /// Working directory for tools (default: current directory)
-        #[arg(long)]
-        dir: Option<PathBuf>,
-    },
-    /// Sign in to a subscription provider (codex, claude, gemini, antigravity)
-    Login { provider: String },
-    /// Configured providers and their login state
-    Providers,
-    /// Machines connected to the hub
-    Nodes,
-    /// Recent threads
-    Threads,
-    /// Print a thread
-    Show { thread: String },
-    /// Exchange threads with the hub (both directions)
-    Sync,
-    /// Browser for web chats
-    Browser {
-        #[command(subcommand)]
-        cmd: BrowserCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum BrowserCmd {
-    /// Open a visible window to sign in to a chat site once
-    Login { site: String },
-}
+const SYSTEM: &str = "You are an autonomous agent on the user's device. Your only tool is console. Use shell commands for files, programs, networking, and any other work. You have the full permissions of the shell (root on Android). Decide how to accomplish the user's request yourself. Commands run in separate shells; use explicit paths or cd in each command. Use background jobs and files for long-running tasks. Tool output is bounded; redirect large output to files and inspect it in chunks. Reply to the user when finished.";
 
 #[tokio::main]
-async fn main() {
-    if let Err(e) = real_main().await {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+async fn main() -> Result<()> {
+    let path = std::env::var_os("KRON_CONFIG").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("kron.json"));
+    if !path.exists() {
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&Config {
+                base_url: "https://api.openai.com/v1".into(),
+                model: "gpt-4.1".into(),
+                api_key: String::new(),
+            })?,
+        )?;
+        eprintln!("Created {}. Set base_url, model and api_key before sending a message.", path.display());
     }
-}
-
-async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
-    let cfg = Arc::new(Config::load(cli.config.as_deref())?);
-    let store = Store::new(cfg.path("threads"));
-    let hub = if cli.local { None } else { node::Client::from_config(&cfg) };
-
-    match cli.cmd {
-        Some(Cmd::Init) => init(&cfg),
-        Some(Cmd::Serve) => hub::serve(cfg.clone(), workdir(&cfg, None)?).await,
-        Some(Cmd::App) => {
-            if !cfg.file.exists() {
-                init(&cfg)?;
-            }
-            let cfg = Arc::new(Config::load(Some(&cfg.file))?);
-            let mut dir = workdir(&cfg, None)?;
-            if let Some(sb) = sandbox::get() {
-                // The agent works in the container's /root; fetch the rootfs now so it is ready.
-                dir = sb.home();
-                std::fs::create_dir_all(&dir)?;
-                tokio::spawn(async move {
-                    if let Err(e) = sb.ready().await {
-                        eprintln!("sandbox: {e:#}");
-                    }
-                });
-            }
-            if let Some(client) = hub {
-                let (cfg, name, dir) = (cfg.clone(), cfg.node_name(), dir.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = node::work(cfg, client, name, dir, false, None).await {
-                        eprintln!("node: {e:#}");
-                    }
-                });
-            }
-            hub::serve(cfg, dir).await
+    let config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if cfg!(target_os = "android") {
+        let output =
+            Command::new("su").args(["-c", "id -u"]).output().await.context("Android requires su root access")?;
+        if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "0" {
+            bail!("Grant KRON root access in your root manager");
         }
-        Some(Cmd::Node { dir }) => {
-            let client = hub.context("set [hub] url (and token) in config first")?;
-            let name = cfg.node_name();
-            node::work(cfg.clone(), client, name, workdir(&cfg, dir)?, false, None).await
-        }
-        Some(Cmd::Login { provider }) => auth::login(&cfg, &provider).await,
-        Some(Cmd::Providers) => {
-            for (name, p) in &cfg.providers {
-                let state = match p.kind.as_str() {
-                    "codex" | "claude" | "gemini" | "antigravity" => {
-                        auth::Auth::new(&cfg, name, &p.kind, p)?.describe()
-                    }
-                    _ if llm::api_key(p).is_some() => "api key set".into(),
-                    _ => "no api key (set api_key or api_key_env)".into(),
-                };
-                let search = if cfg.search_provider().as_deref() == Some(name) { ", web search" } else { "" };
-                println!("{name:14} {:12} {:24} {state}{search}", p.kind, p.model);
-            }
-            Ok(())
-        }
-        Some(Cmd::Nodes) => {
-            let info = hub.context("no [hub] url configured")?.info().await?;
-            for n in info["nodes"].as_array().into_iter().flatten() {
-                let browser = if n["browser"] == true { "  browser" } else { "" };
-                println!(
-                    "{:20} {:8} {}{browser}",
-                    n["name"].as_str().unwrap_or(""),
-                    n["os"].as_str().unwrap_or(""),
-                    n["cwd"].as_str().unwrap_or("")
-                );
-            }
-            Ok(())
-        }
-        Some(Cmd::Threads) => {
-            let list = match &hub {
-                Some(c) => c.threads().await?,
-                None => store.list(),
-            };
-            for t in list.iter().take(50) {
-                let when = chrono::DateTime::from_timestamp_millis(t.updated)
-                    .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_default();
-                println!("{:20} {when}  {}", t.name, t.title);
-            }
-            Ok(())
-        }
-        Some(Cmd::Show { thread }) => {
-            let records = match &hub {
-                Some(c) => c.thread(&thread).await?,
-                None => store.load(&thread)?,
-            };
-            for r in records {
-                print_message(&r.msg);
-            }
-            Ok(())
-        }
-        Some(Cmd::Sync) => {
-            let c = hub.context("no [hub] url configured")?;
-            let (mut up, mut down) = (0, 0);
-            for t in store.list() {
-                up += c.merge(&t.name, &store.load(&t.name)?).await?;
-            }
-            for t in c.threads().await? {
-                down += store.merge(&t.name, c.thread(&t.name).await?)?;
-            }
-            println!("sent {up} messages, received {down}");
-            Ok(())
-        }
-        Some(Cmd::Browser { cmd: BrowserCmd::Login { site } }) => browser::login(&cfg, &site).await,
-        None => run(cfg, store, hub, cli.run).await,
     }
-}
-
-fn workdir(cfg: &Config, explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let dir = match explicit.or_else(|| cfg.hub.workdir.as_ref().map(PathBuf::from)) {
-        Some(d) => d,
-        None => std::env::current_dir()?,
-    };
-    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
-}
-
-fn init(cfg: &Config) -> Result<()> {
-    let path = &cfg.file;
-    if path.exists() {
-        bail!("{} already exists", path.display());
+    let listen = std::env::var("KRON_LISTEN").unwrap_or_else(|_| "127.0.0.1:7790".into());
+    let address: std::net::SocketAddr = listen.parse()?;
+    if !address.ip().is_loopback() {
+        bail!("KRON_LISTEN must be a loopback address");
     }
-    std::fs::create_dir_all(path.parent().unwrap_or(&cfg.home))?;
-    std::fs::write(path, config::EXAMPLE)?;
-    println!("Wrote {}", path.display());
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let app = Arc::new(App {
+        config,
+        client: reqwest::Client::new(),
+        history: Mutex::new(vec![json!({"role":"system", "content":SYSTEM})]),
+        origin: format!("http://{}", listener.local_addr()?),
+    });
+    eprintln!("{}", app.origin);
+    axum::serve(
+        listener,
+        Router::new()
+            .route("/", get(|| async { Html(include_str!("index.html")) }))
+            .route("/message", post(message))
+            .with_state(app),
+    )
+    .await?;
     Ok(())
 }
 
-fn print_message(m: &Message) {
-    match m {
-        Message::User { content } => println!("\n> {content}"),
-        Message::Assistant { text, tool_calls, .. } => {
-            if let Some(t) = text {
-                println!("\n{t}");
+#[derive(Deserialize)]
+struct Input {
+    text: String,
+}
+
+type ApiError = (StatusCode, String);
+
+async fn message(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(input): Json<Input>,
+) -> Result<Json<Value>, ApiError> {
+    // A root console is local only. Require the page's origin and custom header
+    // so arbitrary websites cannot send commands through this endpoint.
+    if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(app.origin.as_str())
+        || headers.get("x-kron").and_then(|v| v.to_str().ok()) != Some("1")
+    {
+        return Err((StatusCode::FORBIDDEN, "Open KRON on its local address".into()));
+    }
+    if input.text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty message".into()));
+    }
+    let mut history = app.history.try_lock().map_err(|_| (StatusCode::CONFLICT, "Agent is busy".into()))?;
+    // A failed request must not leave an incomplete tool exchange in history.
+    let mut next = history.clone();
+    next.push(json!({"role":"user", "content":input.text}));
+    let answer = run(&app, &mut next).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    *history = next;
+    Ok(Json(json!({"text":answer})))
+}
+
+async fn run(app: &App, messages: &mut Vec<Value>) -> Result<String> {
+    loop {
+        let body = json!({"model":app.config.model, "messages":messages, "tools":[{
+            "type":"function", "function":{
+                "name":"console", "description":"Execute a shell command on this device with full permissions. Returns exit code, stdout and stderr. Each invocation uses a fresh shell.",
+                "parameters":{"type":"object", "properties":{"command":{"type":"string"}}, "required":["command"], "additionalProperties":false}
             }
-            for tc in tool_calls {
-                println!("· {} {}", tc.name, types::preview(&tc.arguments.to_string(), 200));
-            }
+        }]});
+        let mut request =
+            app.client.post(format!("{}/chat/completions", app.config.base_url.trim_end_matches('/'))).json(&body);
+        if !app.config.api_key.is_empty() {
+            request = request.bearer_auth(&app.config.api_key);
         }
-        Message::Tool { content, .. } => println!("  {}", types::preview(content, 200).replace('\n', "\n  ")),
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("Model API returned HTTP {status}");
+        }
+        let value: Value = response.json().await?;
+        let reply = value["choices"][0]["message"].clone();
+        if reply["role"] != "assistant" {
+            bail!("Model API returned no assistant message");
+        }
+        let calls = reply["tool_calls"].as_array().cloned().unwrap_or_default();
+        let text = reply["content"].as_str().unwrap_or_default().to_owned();
+        messages.push(reply);
+        if calls.is_empty() {
+            return Ok(text);
+        }
+        for call in calls {
+            let result = async {
+                if call["function"]["name"] != "console" {
+                    bail!("Unknown tool; use console");
+                }
+                let args: Value =
+                    serde_json::from_str(call["function"]["arguments"].as_str().context("Missing arguments")?)?;
+                console(args["command"].as_str().context("Missing command")?).await
+            }
+            .await;
+            messages.push(json!({"role":"tool", "tool_call_id":call["id"],
+                "content":match result { Ok(output)=>output, Err(e)=>format!("Console error: {e:#}") }}));
+        }
     }
 }
 
-async fn run(cfg: Arc<Config>, store: Store, hub: Option<node::Client>, args: RunArgs) -> Result<()> {
-    let mut req = TurnReq {
-        thread: args.thread.clone().unwrap_or_else(store::new_thread_name),
-        mode: if args.web.is_some() {
-            "web".into()
-        } else if args.chat {
-            "chat".into()
-        } else {
-            "agent".into()
-        },
-        agent: args.agent.clone(),
-        provider: args.provider.clone(),
-        model: args.model.clone(),
-        node: args.on.clone(),
-        site: args.web.clone(),
-        access: if args.read_only { "read".into() } else { String::new() },
-        ..Default::default()
-    };
-    if req.node.is_some() && hub.is_none() {
-        bail!("--on needs a hub: set [hub] url in config");
-    }
-
-    // With a hub and no --on, this very process serves as the node, so tools
-    // run here, in the current directory, while the thread lives on the hub.
-    let mut worker = None;
-    if let (Some(client), None) = (&hub, &req.node) {
-        let name = format!("{}-cli{}", cfg.node_name(), std::process::id());
-        let cwd = std::env::current_dir()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        worker = Some(tokio::spawn(node::work(cfg.clone(), client.clone(), name.clone(), cwd, true, Some(tx))));
-        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(15), rx).await, Ok(Ok(()))) {
-            bail!("cannot connect to hub {} (check url/token, or use --local)", cfg.hub.url.as_deref().unwrap_or(""));
+async fn capture(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
+    let mut kept = Vec::new();
+    let mut buf = [0; 4096];
+    let mut omitted = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
         }
-        req.node = Some(name);
+        let take = n.min(32_768 - kept.len());
+        kept.extend_from_slice(&buf[..take]);
+        omitted |= take < n;
     }
+    let mut text = String::from_utf8_lossy(&kept).into_owned();
+    if omitted {
+        text.push_str("\n[output truncated]");
+    }
+    Ok(text)
+}
 
-    let interactive = args.prompt.is_empty() && std::io::stdin().is_terminal();
-    let result = if interactive {
-        eprintln!("kron · thread {} · empty line or Ctrl+D to quit", req.thread);
-        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
-        loop {
-            eprint!("\n› ");
-            let Some(line) = lines.next_line().await? else { break Ok(()) };
-            if line.trim().is_empty() {
-                break Ok(());
-            }
-            req.text = line;
-            if let Err(e) = one(&cfg, &store, &hub, &req).await {
-                eprintln!("error: {e:#}");
-            }
-        }
+async fn console(command: &str) -> Result<String> {
+    let mut shell = if cfg!(target_os = "android") {
+        let mut c = Command::new("su");
+        c.args(["-c", command]);
+        c
     } else {
-        req.text = if args.prompt.is_empty() {
-            let mut s = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
-            s
-        } else {
-            args.prompt.join(" ")
-        };
-        if req.text.trim().is_empty() {
-            bail!("empty prompt");
-        }
-        let r = one(&cfg, &store, &hub, &req).await;
-        eprintln!("[thread {}]", req.thread);
-        r
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
     };
-    if let Some(w) = worker {
-        w.abort();
-    }
-    browser::shutdown().await;
-    local::shutdown().await;
-    result
+    let mut child =
+        shell.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+    let (out, err, status) =
+        tokio::join!(capture(child.stdout.take().unwrap()), capture(child.stderr.take().unwrap()), child.wait());
+    Ok(format!("exit: {}\nstdout:\n{}\nstderr:\n{}", status?.code().unwrap_or(-1), out?, err?))
 }
 
-async fn one(cfg: &Arc<Config>, store: &Store, hub: &Option<node::Client>, req: &TurnReq) -> Result<()> {
-    match hub {
-        Some(client) => {
-            client.run(req, &Stdout).await?;
-        }
-        None => {
-            let exec = Arc::new(agent::Local::new(cfg, std::env::current_dir()?));
-            turn::turn(cfg, store, req, exec, &Stdout).await?;
-            println!();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn console_reports_output_and_exit() {
+        let result = console("printf hello; printf problem >&2; exit 7").await.unwrap();
+        assert!(result.contains("exit: 7"));
+        assert!(result.contains("stdout:\nhello"));
+        assert!(result.contains("stderr:\nproblem"));
     }
-    Ok(())
+    #[tokio::test]
+    async fn capture_drains_large_output() {
+        let bytes = vec![b'x'; 100_000];
+        let result = capture(bytes.as_slice()).await.unwrap();
+        assert!(result.starts_with(&"x".repeat(32_768)));
+        assert!(result.ends_with("[output truncated]"));
+    }
 }
